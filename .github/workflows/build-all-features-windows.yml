@@ -1,0 +1,134 @@
+name: RAWcooked Windows x64 - stock vs ALL implemented
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 / ${{ matrix.variant }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [stock, all-implemented]
+
+    steps:
+      - name: Checkout RAWcooked fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up MSYS2 / MinGW UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            autoconf
+            automake
+            libtool
+            make
+            git
+            python
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Allow all flavors through the central license gate (experimental build)
+        if: matrix.variant == 'all-implemented'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          # Patch the implementation of the central license check, rather than
+          # trying to predict every supported DPX/TIFF/WAV/... flavor enum.
+          # All actual parsing/encoding code remains unchanged. This DOES NOT
+          # implement formats unsupported by the source tree.
+          root = Path('Source/Lib/License')
+          if not root.is_dir():
+              raise SystemExit(f'Expected source directory missing: {root}')
+          files = [p for p in root.rglob('*') if p.suffix in ('.cpp', '.h', '.hpp')]
+          regex = re.compile(
+              r'(?m)^[ \t]*(?:inline[ \t]+)?bool[ \t]+'
+              r'(?:[A-Za-z_]\w*::)*IsSupported[ \t]*'
+              r'\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{'
+          )
+          matches = []
+          for file in files:
+              source = file.read_text(encoding='utf-8-sig')
+              for match in regex.finditer(source):
+                  matches.append((file, source, match))
+          if len(matches) != 1:
+              print('Possible references to IsSupported (for diagnosis):')
+              for file in files:
+                  for line_no, line in enumerate(file.read_text(encoding='utf-8-sig').splitlines(), 1):
+                      if 'IsSupported' in line:
+                          print(f'{file}:{line_no}: {line.strip()[:150]}')
+              raise SystemExit(f'Expected exactly one IsSupported definition; found {len(matches)}. '
+                               'Do not silently patch an unknown upstream version.')
+          file, source, match = matches[0]
+          insertion = ('\n    // EXPERIMENTAL TEST BUILD: skip the flavor license gate.\n'
+                       '    // The actual format implementation still decides what works.\n'
+                       '    return true;\n')
+          original = source
+          source = source[:match.end()] + insertion + source[match.end():]
+          file.write_text(source, encoding='utf-8', newline='')
+          print('Patched file:', file)
+          print('Matched function:', match.group(0).strip())
+          assert 'return true;' in source and source != original
+          PY
+          git diff --check
+          git diff -- Source/Lib/License
+
+      - name: Build Windows command-line executable
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd Project/GNU/CLI
+          bash autogen.sh
+          LIBS='-lshell32 -lws2_32' \
+          CXXFLAGS='-O2 -std=gnu++17' \
+          LDFLAGS='-static-libgcc -static-libstdc++' \
+          ./configure
+          make -j4
+          test -s rawcooked.exe
+          ./rawcooked.exe --version
+          ./rawcooked.exe --show-license > ../../../license-report.txt 2>&1
+
+      - name: Bundle .exe and runtime DLLs
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp Project/GNU/CLI/rawcooked.exe dist/
+          cp license-report.txt dist/
+          cp LICENSE dist/UPSTREAM-LICENSE.txt
+          cat > dist/README.txt <<'TXT'
+          RAWcooked: independent, experimental Windows x64 build.
+          Not an official MediaArea binary.
+          Build variant: ${{ matrix.variant }}
+          The 'all-implemented' variant modifies IsSupported() at build time.
+          It does NOT add missing codecs/formats. The --show-license report
+          may still show the stock entries, because the display list is not
+          rewritten. Test supported flavors with actual inputs and --check full.
+          External ffmpeg.exe required; https://ffmpeg.org/download.html
+          Code: https://github.com/MediaArea/RAWcooked
+          TXT
+          for dll in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
+            if test -f "/ucrt64/bin/$dll"; then cp "/ucrt64/bin/$dll" dist/; fi
+          done
+          objdump -p dist/rawcooked.exe | grep 'DLL Name:' > dist/dependencies.txt || true
+          ls -lh dist
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: rawcooked-windows-x64-${{ matrix.variant }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
