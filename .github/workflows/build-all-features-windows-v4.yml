@@ -1,0 +1,212 @@
+name: RAWcooked Windows x64 - stock vs ALL implemented (v4 line-endings fix)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 / ${{ matrix.variant }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        variant: [stock, all-implemented]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            autoconf
+            automake
+            libtool
+            make
+            git
+            python
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Print toolchain diagnostics
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          {
+            echo 'Compiler / build tools:'
+            command -v gcc g++ make python3 || true
+            g++ --version | head -n 1
+            make --version | head -n 1
+            python3 --version
+            echo 'Repo revision:'
+            git rev-parse HEAD
+            echo 'Relevant source directories:'
+            ls -ld Project/GNU/CLI Source/Lib/License
+          } 2>&1 | tee logs/environment.txt
+
+      - name: Allow all license-gated flavors (experimental build only)
+        if: matrix.variant == 'all-implemented'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('Source/Lib/License/License.cpp')
+          original = path.read_bytes()
+          # Work on bytes to preserve Windows CRLF and every existing byte.
+          pattern = re.compile(
+              rb'\bbool\s+license_internal::IsSupported\s*\('
+              rb'\s*size_t\s+Type\s*,\s*size_t\s+SubType\s*\)\s*\{'
+          )
+          matches = list(pattern.finditer(original))
+          if len(matches) != 1:
+              for no, line in enumerate(original.decode('utf-8-sig', errors='replace').splitlines(), 1):
+                  if 'license_internal::IsSupported' in line:
+                      print(f'{path}:{no}: {line}')
+              raise SystemExit(f'Expected one internal license gate, found {len(matches)}')
+
+          nl = b'\r\n' if original.count(b'\r\n') > original.count(b'\n') / 2 else b'\n'
+          insertion = nl.join((
+              b'',
+              b'    // EXPERIMENTAL: allow the already-implemented formats through.',
+              b'    // This does NOT add missing codecs.',
+              b'    return true;',
+              b''
+          ))
+          match = matches[0]
+          patched = original[:match.end()] + insertion + original[match.end():]
+          assert patched.count(b'EXPERIMENTAL: allow') == 1
+          assert patched.replace(insertion, b'', 1) == original
+          path.write_bytes(patched)
+
+          # Save the modified function without checking unrelated repository files.
+          excerpt = patched[max(0, match.start() - 8):match.end() + len(insertion) + 160]
+          Path('logs/license-patch.txt').write_bytes(excerpt)
+          print(f'Patched one function in {path}; line ending:', repr(nl))
+          print(excerpt.decode('utf-8', errors='replace'))
+          PY
+
+      - name: Provide missing bundled-FLAC UTF-8 helpers for Windows
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          # RAWcooked bundles libFLAC sources. Some of those sources call
+          # fopen_utf8/fprintf_utf8, but this GNU build omits their definitions.
+          # Keep the helper in a separate object, not a system FLAC DLL.
+          cat > logs/flac_utf8_compat.c <<'C'
+          #include <stdio.h>
+          #include <stdarg.h>
+          #include <stdlib.h>
+          #ifdef _WIN32
+          #include <windows.h>
+          static wchar_t *from_utf8(const char *source) {
+              if (!source) return NULL;
+              int n = MultiByteToWideChar(CP_UTF8, 0, source, -1, NULL, 0);
+              if (n <= 0) return NULL;
+              wchar_t *target = (wchar_t *)malloc((size_t)n * sizeof(wchar_t));
+              if (!target) return NULL;
+              if (!MultiByteToWideChar(CP_UTF8, 0, source, -1, target, n)) {
+                  free(target);
+                  return NULL;
+              }
+              return target;
+          }
+          #endif
+          FILE *fopen_utf8(const char *filename, const char *mode) {
+          #ifdef _WIN32
+              wchar_t *name = from_utf8(filename);
+              wchar_t *m = from_utf8(mode);
+              FILE *f = (name && m) ? _wfopen(name, m) : NULL;
+              free(name);
+              free(m);
+              return f;
+          #else
+              return fopen(filename, mode);
+          #endif
+          }
+          int fprintf_utf8(FILE *stream, const char *format, ...) {
+              va_list args;
+              va_start(args, format);
+              int r = vfprintf(stream, format, args);
+              va_end(args);
+              return r;
+          }
+          C
+          gcc -std=c11 -O2 -Wall -Wextra -c logs/flac_utf8_compat.c -o logs/flac_utf8_compat.o
+          ls -lh logs/flac_utf8_compat.o
+
+      - name: Generate build files and compile
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd Project/GNU/CLI
+          bash autogen.sh 2>&1 | tee ../../../logs/autogen.log
+          # FLAC__NO_DLL stops the bundled FLAC headers marking symbols as
+          # DLL imports (__imp_FLAC__*). Link the UTF-8 helper object as well.
+          CPPFLAGS='-DFLAC__NO_DLL' \
+          LIBS='../../../logs/flac_utf8_compat.o -lshell32 -lws2_32' \
+          CXXFLAGS='-O2 -std=gnu++17' \
+          LDFLAGS='-static-libgcc -static-libstdc++' \
+          ./configure 2>&1 | tee ../../../logs/configure.log
+          make -j2 V=1 2>&1 | tee ../../../logs/make.log
+          find . -iname 'rawcooked.exe' -print | tee ../../../logs/executables.txt
+          test -s rawcooked.exe
+          ./rawcooked.exe --version > ../../../logs/version.txt 2>&1 || true
+          ./rawcooked.exe --show-license > ../../../logs/license-report.txt 2>&1 || true
+
+      - name: Package Windows EXE
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp Project/GNU/CLI/rawcooked.exe dist/
+          cp LICENSE dist/UPSTREAM-LICENSE.txt
+          cp logs/license-report.txt dist/ || true
+          cat > dist/README.txt <<'TXT'
+          Independent experimental RAWcooked Windows x64 build (v4).
+          Variant: ${{ matrix.variant }}
+          This is NOT an official MediaArea binary.
+          The all-implemented version bypasses the flavor-level license check;
+          it does not add missing format implementations or prove correct output.
+          Test against original files and verify lossless round trips.
+          Install FFmpeg separately and ensure ffmpeg.exe is on PATH.
+          TXT
+          for dll in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
+            if test -f "/ucrt64/bin/$dll"; then cp "/ucrt64/bin/$dll" dist/; fi
+          done
+          objdump -p dist/rawcooked.exe | grep 'DLL Name:' > dist/dependencies.txt || true
+          ls -lh dist
+
+      - name: Upload Windows EXE
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rawcooked-windows-x64-${{ matrix.variant }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Always upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rawcooked-logs-${{ matrix.variant }}
+          path: |
+            logs/
+            Project/GNU/CLI/config.log
+          if-no-files-found: warn
+          retention-days: 14
